@@ -17,20 +17,27 @@ Security rules kept here:
   such values sent by the client are ignored.
 - Only items set up for the customer's company with a valid Standard Selling
   price can be ordered.
-- The order is saved as a Draft (docstatus 0) and never submitted.
+- Submission is controlled by the site config key `customer_portal_auto_submit`:
+  off (default) -> the order stays a Draft for staff review;
+  on            -> the order is submitted right away. If ERPNext's submit checks fail (credit limit, frozen
+                   customer, ...), the order is kept as a Draft and the customer is told it awaits review.
+- Duplicate protection: the app sends one `client_request_key` per cart. The same key from the same user
+  returns the order already created instead of making a second one (kept for 24 hours).
 """
 
 from contextlib import contextmanager
 
 import frappe
 from frappe.rate_limiter import rate_limit
-from frappe.utils import add_days, escape_html, flt, getdate, nowdate, strip_html
+from frappe.utils import add_days, cint, escape_html, flt, getdate, nowdate, strip_html
 
 PRICE_LIST = "Standard Selling"
 MAX_LINES = 50
 MAX_QTY = 10000
 MAX_DELIVERY_DAYS = 90
 SOURCE_TAG = "customer_portal_app"
+REQUEST_KEY_TTL = 24 * 60 * 60
+PENDING = "__pending__"
 
 
 class PortalError(Exception):
@@ -229,18 +236,65 @@ def _clean_error_message(exc):
 	return text[:300]
 
 
+def _auto_submit():
+	return bool(cint(frappe.conf.get("customer_portal_auto_submit")))
+
+
+def _request_key(user, key):
+	"""Redis key for idempotency, scoped to the user. Returns None when the client sent no usable key."""
+	if not isinstance(key, str):
+		return None
+	key = key.strip()
+	if not key or len(key) > 64 or not all(c.isalnum() or c in "-_" for c in key):
+		return None
+	return frappe.cache().make_key(f"customer_portal:order_key:{user}:{key}")
+
+
+def _cache_get(rkey):
+	value = frappe.cache().get(rkey)
+	if isinstance(value, bytes):
+		value = value.decode()
+	return value
+
+
+def _order_result(name, submit_note=None):
+	so = frappe.get_doc("Sales Order", name)
+	data = {
+		"name": so.name,
+		"status": so.status,
+		"docstatus": so.docstatus,
+		"submitted": so.docstatus == 1,
+		"grand_total": flt(so.grand_total),
+		"rounded_total": flt(so.rounded_total),
+		"currency": so.currency,
+		"delivery_date": str(so.delivery_date) if so.delivery_date else None,
+		"lines": len(so.items),
+	}
+	if submit_note:
+		data["review_reason"] = submit_note
+	return data
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=120, seconds=60 * 60)  # per client IP (Frappe default); generous for shared mobile IPs
-def create_order(delivery_date=None, items=None, po_no=None, notes=None, **ignored):
-	"""Create a Draft Sales Order for the logged-in portal customer.
+def create_order(delivery_date=None, items=None, po_no=None, notes=None, client_request_key=None, **ignored):
+	"""Create a Sales Order for the logged-in portal customer (Draft, or submitted when auto-submit is on).
 
-	Body (JSON): {delivery_date, po_no?, notes?, items: [{item_code, qty}]}
+	Body (JSON): {delivery_date, po_no?, notes?, client_request_key?, items: [{item_code, qty}]}
 	Anything else (customer, company, currency, rate, price_list, ...) is ignored.
-	Returns {"data": {name, status, docstatus, grand_total, rounded_total, currency, delivery_date, lines}}
+	Returns {"data": {name, status, docstatus, submitted, grand_total, rounded_total, currency, delivery_date,
+	lines, review_reason?}}
 	or {"error_code", "message"} with an HTTP 4xx/5xx status.
 	"""
 	try:
 		user, customer, contact = _resolve_customer()
+		rkey = _request_key(user, client_request_key)
+		if rkey:
+			previous = _cache_get(rkey)
+			if previous == PENDING:
+				raise PortalError("ORDER_IN_PROGRESS", "This order is already being placed. Please wait a moment.", 409)
+			if previous and frappe.db.get_value("Sales Order", previous, "customer") == customer:
+				return {"data": _order_result(previous)}
 		company = _resolve_company(customer)
 		wanted = _parse_items(items)
 		dd = _parse_delivery_date(delivery_date)
@@ -281,6 +335,8 @@ def create_order(delivery_date=None, items=None, po_no=None, notes=None, **ignor
 			for code, qty in wanted.items()
 		]
 		order_user = _order_user()
+		if rkey and not frappe.cache().set(rkey, PENDING, ex=120, nx=True):
+			raise PortalError("ORDER_IN_PROGRESS", "This order is already being placed. Please wait a moment.", 409)
 	except PortalError as err:
 		return _error_response(err)
 
@@ -306,23 +362,36 @@ def create_order(delivery_date=None, items=None, po_no=None, notes=None, **ignor
 				}
 			)
 			so.flags.ignore_permissions = True
-			so.insert()  # Draft only: never submitted here.
+			so.insert()
 			note = f"<b>Placed via customer portal app</b> by {escape_html(user)}"
 			if notes.strip():
 				note += "<br>Customer notes: " + escape_html(notes.strip()).replace("\n", "<br>")
 			so.add_comment("Comment", note)
-			result = {
-				"name": so.name,
-				"status": so.status,
-				"docstatus": so.docstatus,
-				"grand_total": flt(so.grand_total),
-				"rounded_total": flt(so.rounded_total),
-				"currency": so.currency,
-				"delivery_date": str(dd),
-				"lines": len(lines),
-			}
+
+			review_reason = None
+			if _auto_submit():
+				frappe.db.savepoint("customer_portal_submit")
+				try:
+					so.submit()
+				except Exception as submit_exc:
+					# Keep the order as a Draft so staff can review it; tell the customer why.
+					frappe.db.rollback(save_point="customer_portal_submit")
+					review_reason = _clean_error_message(submit_exc)
+					frappe.clear_messages()
+					frappe.log_error(
+						title="Customer portal auto-submit failed (kept as Draft)",
+						message=f"user={user} order={so.name}\n{frappe.get_traceback()}",
+					)
+					frappe.get_doc("Sales Order", so.name).add_comment(
+						"Comment", "Auto-submit failed, kept as Draft for review: " + escape_html(review_reason)
+					)
+			result = _order_result(so.name, review_reason)
+		if rkey:
+			frappe.cache().set(rkey, result["name"], ex=REQUEST_KEY_TTL)
 	except Exception as exc:
 		frappe.db.rollback()
+		if rkey:
+			frappe.cache().delete(rkey)
 		message = _clean_error_message(exc)
 		frappe.log_error(title="Customer portal order failed", message=f"user={user}\n{frappe.get_traceback()}")
 		frappe.clear_messages()
