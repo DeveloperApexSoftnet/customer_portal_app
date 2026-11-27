@@ -12,4 +12,6 @@ required_apps = ["erpnext"]
 # same name is no longer reached once this app is installed.
 override_whitelisted_methods = {
 	"customer_portal_create_order": "customer_portal.api.create_order",
+	"customer_portal_update_order": "customer_portal.api.update_order",
+	"customer_portal_cancel_order": "customer_portal.api.cancel_order",
 }

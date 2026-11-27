@@ -17,10 +17,11 @@ Security rules kept here:
   such values sent by the client are ignored.
 - Only items set up for the customer's company with a valid Standard Selling
   price can be ordered.
-- Submission is controlled by the site config key `customer_portal_auto_submit`:
-  off (default) -> the order stays a Draft for staff review;
-  on            -> the order is submitted right away. If ERPNext's submit checks fail (credit limit, frozen
-                   customer, ...), the order is kept as a Draft and the customer is told it awaits review.
+- Orders from the app are ALWAYS saved as Draft for staff review (1.2.0). The app never submits. The old
+  site config key `customer_portal_auto_submit` is no longer read.
+- update_order / cancel_order (1.2.0) only touch the customer's own Drafts that were placed in the app
+  (utm_content = customer_portal_app). Submitted, cancelled or staff-created orders are refused.
+  "Cancel" deletes the Draft (Frappe can't cancel a Draft); Frappe keeps a Deleted Document copy for audit.
 - Duplicate protection: the app sends one `client_request_key` per cart. The same key from the same user
   returns the order already created instead of making a second one (kept for 24 hours).
 """
@@ -29,7 +30,7 @@ from contextlib import contextmanager
 
 import frappe
 from frappe.rate_limiter import rate_limit
-from frappe.utils import add_days, cint, escape_html, flt, getdate, nowdate, strip_html
+from frappe.utils import add_days, escape_html, flt, getdate, nowdate, strip_html
 
 PRICE_LIST = "Standard Selling"
 MAX_LINES = 50
@@ -236,10 +237,6 @@ def _clean_error_message(exc):
 	return text[:300]
 
 
-def _auto_submit():
-	return bool(cint(frappe.conf.get("customer_portal_auto_submit")))
-
-
 def _request_key(user, key):
 	"""Redis key for idempotency, scoped to the user. Returns None when the client sent no usable key."""
 	if not isinstance(key, str):
@@ -258,6 +255,7 @@ def _cache_get(rkey):
 
 
 def _order_result(name, submit_note=None):
+	"""Fields returned to the app. `modified` lets the app detect concurrent changes on update/cancel."""
 	so = frappe.get_doc("Sales Order", name)
 	data = {
 		"name": so.name,
@@ -269,6 +267,7 @@ def _order_result(name, submit_note=None):
 		"currency": so.currency,
 		"delivery_date": str(so.delivery_date) if so.delivery_date else None,
 		"lines": len(so.items),
+		"modified": str(so.modified),
 	}
 	if submit_note:
 		data["review_reason"] = submit_note
@@ -278,7 +277,7 @@ def _order_result(name, submit_note=None):
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=120, seconds=60 * 60)  # per client IP (Frappe default); generous for shared mobile IPs
 def create_order(delivery_date=None, items=None, po_no=None, notes=None, client_request_key=None, **ignored):
-	"""Create a Sales Order for the logged-in portal customer (Draft, or submitted when auto-submit is on).
+	"""Create a Draft Sales Order for the logged-in portal customer (staff review and submit it in ERPNext).
 
 	Body (JSON): {delivery_date, po_no?, notes?, client_request_key?, items: [{item_code, qty}]}
 	Anything else (customer, company, currency, rate, price_list, ...) is ignored.
@@ -368,24 +367,7 @@ def create_order(delivery_date=None, items=None, po_no=None, notes=None, client_
 				note += "<br>Customer notes: " + escape_html(notes.strip()).replace("\n", "<br>")
 			so.add_comment("Comment", note)
 
-			review_reason = None
-			if _auto_submit():
-				frappe.db.savepoint("customer_portal_submit")
-				try:
-					so.submit()
-				except Exception as submit_exc:
-					# Keep the order as a Draft so staff can review it; tell the customer why.
-					frappe.db.rollback(save_point="customer_portal_submit")
-					review_reason = _clean_error_message(submit_exc)
-					frappe.clear_messages()
-					frappe.log_error(
-						title="Customer portal auto-submit failed (kept as Draft)",
-						message=f"user={user} order={so.name}\n{frappe.get_traceback()}",
-					)
-					frappe.get_doc("Sales Order", so.name).add_comment(
-						"Comment", "Auto-submit failed, kept as Draft for review: " + escape_html(review_reason)
-					)
-			result = _order_result(so.name, review_reason)
+			result = _order_result(so.name)
 		if rkey:
 			frappe.cache().set(rkey, result["name"], ex=REQUEST_KEY_TTL)
 	except Exception as exc:
@@ -398,3 +380,145 @@ def create_order(delivery_date=None, items=None, po_no=None, notes=None, client_
 		return _error_response(PortalError("ORDER_FAILED", f"The order could not be created: {message}", 422))
 
 	return {"data": result}
+
+
+# ---------------------------------------------------------------------------------------------------------
+# 1.2.0: edit and cancel the customer's own Draft orders placed in the app
+# ---------------------------------------------------------------------------------------------------------
+
+NOT_EDITABLE_MSG = "This order has already been processed and can no longer be changed."
+NOT_FROM_APP_MSG = "This order was created by our team and can't be changed in the app. Please contact us."
+
+
+def _validated_lines(customer, company, items, dd):
+	"""Same rules as create_order. Returns (lines, currency, pl_currency)."""
+	wanted = _parse_items(items)
+	found = _orderable_items(customer, company, list(wanted))
+	for code in wanted:
+		if code not in found:
+			raise PortalError("ITEM_NOT_AVAILABLE", f"Item {code} is not available for ordering.")
+		if found[code].rate is None:
+			raise PortalError("ITEM_NOT_PRICED", f"Item {code} has no price. Please contact us.")
+	company_currency = frappe.db.get_value("Company", company, "default_currency")
+	pl_currency = frappe.db.get_value("Price List", PRICE_LIST, "currency")
+	currency = frappe.db.get_value("Customer", customer, "default_currency") or company_currency
+	if currency != company_currency or pl_currency != company_currency:
+		raise PortalError("CURRENCY_NOT_SUPPORTED", f"Online ordering is only available in {company_currency}.", 409)
+	lines = [
+		{
+			"item_code": code,
+			"qty": qty,
+			"uom": found[code].uom,
+			"conversion_factor": 1,
+			"price_list_rate": flt(found[code].rate),
+			"rate": flt(found[code].rate),
+			"delivery_date": dd,
+			"warehouse": found[code].default_warehouse,
+		}
+		for code, qty in wanted.items()
+	]
+	return lines, currency, pl_currency
+
+
+def _own_app_draft(name, customer, expected_modified):
+	"""Lock and check the order. 404 if it isn't this customer's (never reveal other customers' orders)."""
+	if not isinstance(name, str) or not name.strip() or len(name) > 140:
+		raise PortalError("NOT_FOUND", "Order not found.", 404)
+	row = frappe.db.get_value(
+		"Sales Order",
+		name.strip(),
+		["name", "customer", "docstatus", "utm_content", "modified"],
+		as_dict=True,
+		for_update=True,
+	)
+	if not row or row.customer != customer:
+		raise PortalError("NOT_FOUND", "Order not found.", 404)
+	if row.docstatus != 0:
+		raise PortalError("ORDER_NOT_EDITABLE", NOT_EDITABLE_MSG, 409)
+	if row.utm_content != SOURCE_TAG:
+		raise PortalError("ORDER_NOT_FROM_APP", NOT_FROM_APP_MSG, 409)
+	if expected_modified and str(expected_modified) != str(row.modified):
+		raise PortalError("ORDER_CHANGED", NOT_EDITABLE_MSG, 409)
+	return row
+
+
+def _text(value, field, limit):
+	value = value or ""
+	if not isinstance(value, str) or len(value) > limit:
+		raise PortalError(f"INVALID_{field.upper()}", f"{field} must be text of at most {limit} characters.")
+	return value.strip()
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=120, seconds=60 * 60)
+def update_order(
+	name=None, delivery_date=None, items=None, po_no=None, notes=None, expected_modified=None, **ignored
+):
+	"""Replace lines, delivery date and PO number of the customer's own Draft placed in the app. Stays Draft.
+
+	Body (JSON): {name, delivery_date, items: [{item_code, qty}], po_no?, notes?, expected_modified?}
+	Returns {"data": {..._order_result, "updated": true}} or {"error_code", "message"} with HTTP 4xx/5xx:
+	404 NOT_FOUND, 409 ORDER_NOT_EDITABLE | ORDER_NOT_FROM_APP | ORDER_CHANGED, 400 validation codes.
+	"""
+	try:
+		user, customer, _contact = _resolve_customer()
+		company = _resolve_company(customer)
+		dd = _parse_delivery_date(delivery_date)
+		po_no = _text(po_no, "po_no", 140)
+		notes = _text(notes, "notes", 1000)
+		_own_app_draft(name, customer, expected_modified)
+		lines, _currency, _plc = _validated_lines(customer, company, items, dd)
+		order_user = _order_user()
+	except PortalError as err:
+		return _error_response(err)
+
+	try:
+		with _as_user(order_user):
+			so = frappe.get_doc("Sales Order", name.strip())
+			so.delivery_date = dd
+			so.po_no = po_no or None
+			so.set("items", [])
+			for line in lines:
+				so.append("items", line)
+			so.flags.ignore_permissions = True
+			so.save()
+			note = f"<b>Edited via customer portal app</b> by {escape_html(user)}"
+			if notes:
+				note += "<br>Customer notes: " + escape_html(notes).replace("\n", "<br>")
+			so.add_comment("Comment", note)
+			result = _order_result(so.name)
+			result["updated"] = True
+	except Exception as exc:
+		frappe.db.rollback()
+		message = _clean_error_message(exc)
+		frappe.log_error(title="Customer portal order update failed", message=f"user={user} order={name}\n{frappe.get_traceback()}")
+		frappe.clear_messages()
+		return _error_response(PortalError("ORDER_FAILED", f"The order could not be updated: {message}", 422))
+	return {"data": result}
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60 * 60)
+def cancel_order(name=None, expected_modified=None, **ignored):
+	"""Cancel (delete) the customer's own Draft placed in the app. Frappe keeps a Deleted Document copy.
+
+	Body (JSON): {name, expected_modified?}
+	Returns {"data": {name, cancelled: true, status: "Cancelled"}} or {"error_code", "message"} (404/409 as above).
+	"""
+	try:
+		user, customer, _contact = _resolve_customer()
+		row = _own_app_draft(name, customer, expected_modified)
+		order_user = _order_user()
+	except PortalError as err:
+		return _error_response(err)
+
+	try:
+		with _as_user(order_user):
+			frappe.delete_doc("Sales Order", row.name, ignore_permissions=True)
+	except Exception as exc:
+		frappe.db.rollback()
+		message = _clean_error_message(exc)
+		frappe.log_error(title="Customer portal order cancel failed", message=f"user={user} order={name}\n{frappe.get_traceback()}")
+		frappe.clear_messages()
+		return _error_response(PortalError("ORDER_FAILED", f"The order could not be cancelled: {message}", 422))
+	return {"data": {"name": row.name, "cancelled": True, "status": "Cancelled"}}
